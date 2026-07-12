@@ -265,6 +265,105 @@ void test_phmsd(boost::mpi3::communicator& world)
   }
 }
 
+// Checks that energy_shared_alg1 gives identical energies/overlaps whether the
+// configuration (unique-excitation) sum is done all-at-once (ndet_batch<0) or in
+// blocks (ndet_batch=B). This is the invariance guard for config batching.
+template<bool MP, class Allocator>
+void test_phmsd_energy_config_inv(boost::mpi3::communicator& world)
+{
+  if (not file_exists(UTEST_WFN) || not file_exists(UTEST_HAMIL))
+  {
+    APP_ABORT(" Wavefunction and/or Hamiltonian file not found. Run unit test with --wfn /path/to/wfn.h5 and --hamil /path/to/hamil.h5. ");
+  }
+  else
+  {
+    GlobalTaskGroup gTG(world);
+    auto TG    = TaskGroup_(gTG, std::string("WfnTG"), 1, gTG.getTotalCores());
+    auto TGwfn = TaskGroup_(gTG, std::string("WfnTG"), 1, gTG.getTotalCores());
+
+    int nwalk = 4;
+    int NMO, NAEA, NAEB;
+    std::tie(NMO, NAEA, NAEB) = read_info_from_wfn(UTEST_WFN, "PHMSD");
+    WALKER_TYPES type = afqmc::getWalkerType(UTEST_WFN, "PHMSD");
+    std::map<std::string, AFQMCInfo> InfoMap;
+    InfoMap.insert(std::pair<std::string, AFQMCInfo>("info0", AFQMCInfo{"info0", NMO, NAEA, NAEB}));
+
+    ptree ham_pt;
+    ham_pt.put("name", "ham0");
+    ham_pt.put("system", "info0");
+    ham_pt.put("filename", UTEST_HAMIL);
+    HamiltonianFactory HamFac(InfoMap);
+    HamFac.push("ham0", ham_pt);
+    Hamiltonian& ham = HamFac.getHamiltonian(gTG, "ham0");
+
+    // Two PHMSD wavefunctions from the same file: full-config vs config-blocked.
+    ptree wfn_full;
+    wfn_full.put("name", "wfn_full");
+    wfn_full.put("system", "info0");
+    wfn_full.put("type", "phmsd");
+    wfn_full.put("filename", UTEST_WFN);
+    wfn_full.put("rediag", "no");
+    wfn_full.put("ndet_batch", -1);
+    ptree wfn_blk1;
+    wfn_blk1.put("name", "wfn_blk1");
+    wfn_blk1.put("system", "info0");
+    wfn_blk1.put("type", "phmsd");
+    wfn_blk1.put("filename", UTEST_WFN);
+    wfn_blk1.put("rediag", "no");
+    wfn_blk1.put("ndet_batch", 1);
+    ptree wfn_blk3;
+    wfn_blk3.put("name", "wfn_blk3");
+    wfn_blk3.put("system", "info0");
+    wfn_blk3.put("type", "phmsd");
+    wfn_blk3.put("filename", UTEST_WFN);
+    wfn_blk3.put("rediag", "no");
+    wfn_blk3.put("ndet_batch", 3);
+
+    WavefunctionFactory WfnFac(InfoMap, MP);
+    WfnFac.push("wfn_full", wfn_full);
+    WfnFac.push("wfn_blk1", wfn_blk1);
+    WfnFac.push("wfn_blk3", wfn_blk3);
+    Wavefunction& wfnF  = WfnFac.getWavefunction(TGwfn, TGwfn, "wfn_full", type, &ham, 1e-6, nwalk);
+    Wavefunction& wfnB1 = WfnFac.getWavefunction(TGwfn, TGwfn, "wfn_blk1", type, &ham, 1e-6, nwalk);
+    Wavefunction& wfnB3 = WfnFac.getWavefunction(TGwfn, TGwfn, "wfn_blk3", type, &ham, 1e-6, nwalk);
+
+    ptree wlk_pt;
+    wlk_pt.put("name", "wset0");
+    wlk_pt.put("walker_type", "collinear");
+    utils::RandomGenerator_t rng;
+    WalkerSet wset(TG, wlk_pt, InfoMap["info0"], &rng);
+    auto initial_guess = WfnFac.getInitialGuess("wfn_full");
+    wset.resize(nwalk, initial_guess[0], initial_guess[1](initial_guess.extension(1), {0, NAEB}));
+
+    // Full-config energies/overlaps.
+    wfnF.Energy(wset);
+    std::vector<ComplexType> EF(nwalk), OvF(nwalk);
+    {
+      int iw = 0;
+      for (auto it = wset.begin(); it != wset.end(); ++it, ++iw)
+      {
+        EF[iw]  = ComplexType(it->energy());
+        OvF[iw] = ComplexType(it->overlap());
+      }
+    }
+
+    // Each config-blocked wavefunction must reproduce the full-config energies/overlaps.
+    auto check = [&](Wavefunction& w) {
+      w.Energy(wset);
+      int iw = 0;
+      for (auto it = wset.begin(); it != wset.end(); ++it, ++iw)
+      {
+        REQUIRE(real(ComplexType(it->energy()))  == Approx(real(EF[iw])).epsilon(1e-4).margin(1e-6));
+        REQUIRE(imag(ComplexType(it->energy()))  == Approx(imag(EF[iw])).epsilon(1e-4).margin(1e-6));
+        REQUIRE(real(ComplexType(it->overlap())) == Approx(real(OvF[iw])).epsilon(1e-4).margin(1e-6));
+        REQUIRE(imag(ComplexType(it->overlap())) == Approx(imag(OvF[iw])).epsilon(1e-4).margin(1e-6));
+      }
+    };
+    check(wfnB1);
+    check(wfnB3);
+  }
+}
+
 TEST_CASE("test_read_phmsd", "[test_read_phmsd]")
 {
   auto world = boost::mpi3::environment::get_world_instance();

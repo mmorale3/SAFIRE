@@ -171,6 +171,7 @@ public:
     app_log(2,"\nPHMSD input:\n{}\n",io::to_string(pt));
     // initialize using verbose input
     nbatch = pt.get<int>("nbatch");
+    ndet_batch = pt.get<int>("ndet_batch");
     number_of_references = pt.get<int>("number_of_references");
 
     // optional
@@ -198,8 +199,79 @@ public:
         if( refc[i] != i ) 
           APP_ABORT(" Error: PHMSD algorithm=1 requires refc[i]==i.\n\n");
       for(int i=0; i<NAEB; i++)
-        if( refc[NAEA+i] != i ) 
+        if( refc[NAEA+i] != i )
           APP_ABORT(" Error: PHMSD algorithm=1 requires refc[i]==i.\n\n");
+    }
+
+    // Tier-2b: pre-build 2D (beta-row x alpha-col) blocks of the beta<-alpha coupling
+    // (OpSpinDetCouplings[1], rows=beta, cols=alpha). block[iv*nab_a+iu] = [cntv x cntu] with
+    // beta rows [iv*Bcb,..) and alpha cols [iu*Bca,..) BOTH renumbered to 0 -> a proper 0-based
+    // CSR usable directly by csrmm (a runtime row-slice would give pntrb[0]!=0, which csrmm rejects).
+    if (energy_algorithm == 1 && ndet_batch > 0)
+    {
+      long ne0 = long(abij.number_of_unique_excitations()[0]);
+      long ne1 = long(abij.number_of_unique_excitations()[1]);
+      long Bca = (long(ndet_batch) < ne0 ? long(ndet_batch) : ne0);  if (Bca < 1) Bca = 1;
+      long Bcb = (long(ndet_batch) < ne1 ? long(ndet_batch) : ne1);  if (Bcb < 1) Bcb = 1;
+      int nab_a = int((ne0 + Bca - 1) / Bca);
+      int nab_b = int((ne1 + Bcb - 1) / Bcb);
+      colblk_nab_alpha = nab_a;
+      int nblk = nab_a * nab_b;
+      using ucsr_mat_t = ma::sparse::ucsr_matrix<ComplexType, int, int,
+                                    shared_allocator<ComplexType>, ma::sparse::is_root>;
+      // per-block local-beta-row nnz counts; block (iv,iu) has cntv rows
+      std::vector<std::vector<int>> counts(nblk);
+      for (int iv = 0; iv < nab_b; iv++)
+      {
+        long cntv = (long(iv) * Bcb + Bcb <= ne1 ? Bcb : ne1 - long(iv) * Bcb);
+        for (int iu = 0; iu < nab_a; iu++)
+          counts[iv * nab_a + iu].assign(std::size_t(cntv), 0);
+      }
+      if (TG.Node().root())
+        for (auto it = abij.configurations_begin(); it < abij.configurations_end(); ++it)
+        {
+          int a = std::get<0>(*it), b = std::get<1>(*it);
+          int iu = a / int(Bca), iv = b / int(Bcb);
+          counts[iv * nab_a + iu][b - iv * int(Bcb)]++;
+        }
+      for (int k = 0; k < nblk; k++)
+        TG.Node().broadcast_n(counts[k].begin(), counts[k].size());
+      // mark empty blocks (no nonzeros) so alg1 can skip them in csrmm
+      colblk_empty.assign(std::size_t(nblk), char(1));
+      for (int k = 0; k < nblk; k++)
+        for (int c : counts[k])
+          if (c > 0) { colblk_empty[k] = 0; break; }
+      std::vector<PsiT_Matrix> cblk;
+      cblk.reserve(nblk);
+      {
+        std::vector<ucsr_mat_t> ucsr;
+        ucsr.reserve(nblk);
+        for (int iv = 0; iv < nab_b; iv++)
+        {
+          long cntv = (long(iv) * Bcb + Bcb <= ne1 ? Bcb : ne1 - long(iv) * Bcb);
+          for (int iu = 0; iu < nab_a; iu++)
+          {
+            long cntu = (long(iu) * Bca + Bca <= ne0 ? Bca : ne0 - long(iu) * Bca);
+            ucsr.emplace_back(ucsr_mat_t(tp_ul_ul{std::size_t(cntv), std::size_t(cntu)},
+                         tp_ul_ul{0, 0}, counts[iv * nab_a + iu], shared_allocator<ComplexType>{TG.Node()}));
+          }
+        }
+        if (TG.Node().root())
+          for (auto it = abij.configurations_begin(); it < abij.configurations_end(); ++it)
+          {
+            int a = std::get<0>(*it), b = std::get<1>(*it);
+            int iu = a / int(Bca), iv = b / int(Bcb);
+            ucsr[iv * nab_a + iu].emplace(std::array<int, 2>{b - iv * int(Bcb), a - iu * int(Bca)},
+                                          ma::conj(std::get<2>(*it)));
+          }
+        TG.Node().barrier();
+        for (int k = 0; k < nblk; k++)
+          cblk.emplace_back(ucsr[k]);
+        TG.Node().barrier();
+      }
+      auto cblk_dev = move_vector<local_csr_Matrix<ComplexType>>(std::move(cblk));
+      OpSpinDetCouplings_sp_colblk =
+          make_vector<local_csr_Matrix<SPComplexType>>(cblk_dev, make_node_allocator<SPComplexType>(TG));
     }
   }
 
@@ -208,6 +280,7 @@ public:
     // read inputs with default options
     int nbatch_default    = ((number_of_devices() > 0) ? -1 : 1);
     int nbatch    = pt0.get<int>("nbatch", nbatch_default);
+    int ndet_batch = pt0.get<int>("ndet_batch", -1);
     int number_of_references = pt0.get<int>("number_of_references", -1);
     // validate inputs
     if ((omp_get_num_threads() > 1) && (nbatch == 0))
@@ -218,6 +291,7 @@ public:
     // create verbose internal inputs
     ptree pt1;
     pt1.put("nbatch", nbatch);
+    pt1.put("ndet_batch", ndet_batch);
     pt1.put("number_of_references", number_of_references);
     // leave as a true optional, to bypass issue with default value
     if( auto val = pt0.get_optional<int>("algorithm") )
@@ -573,6 +647,9 @@ protected:
   // number of walkers in batched Ov, DM, etc...
   int nbatch;
 
+  // config (unique-excitation) block size for energy_shared_alg1 (<0 => all configs at once)
+  int ndet_batch;
+
   std::map<int, int> acta2mo;
   std::map<int, int> actb2mo;
 
@@ -585,6 +662,13 @@ protected:
   // not sure how to avoid this, so just do it, :-(
   std::vector<local_csr_Matrix<ComplexType>> OpSpinDetCouplings;
   std::vector<local_csr_Matrix<SPComplexType>> OpSpinDetCouplings_sp;
+
+  // alpha-column-blocked copies of OpSpinDetCouplings_sp[1] for config batching (Tier 2b).
+  // 2D (beta-row x alpha-col) blocks of OpSpinDetCouplings[1], flattened as [iv*colblk_nab_alpha+iu].
+  // block (iv,iu) = [cntv x cntu], 0-based, device-resident SP. Built in the ctor only when ndet_batch>0.
+  std::vector<local_csr_Matrix<SPComplexType>> OpSpinDetCouplings_sp_colblk;
+  int colblk_nab_alpha = 0;  // number of alpha blocks (row stride into the flattened 2D block list)
+  std::vector<char> colblk_empty;  // per (iv,iu) block: 1 if it has no nonzeros (skip in csrmm)
 
   // eventually switched from CMatrix to SMHSparseMatrix(node)
   std::vector<local_csr_Matrix<ComplexType>> OrbMats;

@@ -43,6 +43,7 @@ if(ENABLE_CUDA)
     detail/CUDA/Kernels/getGIJ.cu
     detail/CUDA/Kernels/extract_overlap_matrix.cu
     detail/CUDA/Kernels/construct_phmsd_R.cu
+    detail/CUDA/Kernels/phmsd_vmf.cu
     detail/CUDA/Kernels/accumulate.cu
     detail/CUDA/Kernels/add_diagonal.cu
     detail/CUDA/Kernels/phmsd_determinants.cu

@@ -22,6 +22,7 @@
 #include <utility> //std::enable_if
 #include <cassert>
 #include <iostream>
+#include <vector>
 
 namespace ma
 {
@@ -746,6 +747,46 @@ void Matrix2MA(char TA, CSR const& A, MultiArray2D& M, Vector const& occups)
   else
     throw std::runtime_error(" Error: Unknown operation in Matrix2MA.");
   using std::fill_n;
+  using std::copy_n;
+#if defined(ENABLE_DEVICE)
+  // Device-resident CSR: indexing the device pointers element-by-element in the scatter
+  // loop below would issue one cudaMemcpy per nonzero (catastrophic for large CSRs; this
+  // was the dominant cost of PHMSD::vMF / generateP1). Instead bulk-mirror the CSR to
+  // host, scatter into a host-side dense buffer, and bulk-copy the result to the device.
+  using int_type   = typename std::decay<CSR>::type::int_type;
+  using index_type = typename std::decay<CSR>::type::index_type;
+  using val_type   = typename std::decay<CSR>::type::value_type;
+  RUNTIME_CHECK(M.stride(1) == 1 && M.stride(0) == M.size(1),
+                "Matrix2MA (device path) requires a contiguous output matrix.");
+  auto nrA = A.size(0);
+  auto nnz = A.num_non_zero_elements();
+  std::vector<int_type>   h_pb(nrA), h_pe(nrA);
+  std::vector<val_type>   h_v(nnz);
+  std::vector<index_type> h_c(nnz);
+  copy_n(A.pointers_begin(), nrA, h_pb.data());
+  copy_n(A.pointers_end(), nrA, h_pe.data());
+  copy_n(A.non_zero_values_data(), nnz, h_v.data());
+  copy_n(A.non_zero_indices2_data(), nnz, h_c.data());
+  int_type p0 = h_pb[0];
+  std::vector<Type> Mh(size_t(M.size(0)) * size_t(M.size(1)), Type(0));
+  const size_t ncM = size_t(M.size(1));
+  const bool   tr  = (TA == 'T' || TA == 'H');
+  const bool   cj  = (TA == 'Z' || TA == 'H');
+  for (int i = 0; i < nrows; i++)
+  {
+    RUNTIME_CHECK(occups[i] >= 0 && occups[i] < A.size(0), "");
+    int ik = int(occups[i]);
+    for (int_type ip = h_pb[ik]; ip < h_pe[ik]; ip++)
+    {
+      val_type vv = h_v[ip - p0];
+      if (cj) vv = ma::conj(vv);
+      size_t col = size_t(h_c[ip - p0]);
+      if (tr) Mh[col * ncM + size_t(i)] = static_cast<Type>(vv);
+      else    Mh[size_t(i) * ncM + col] = static_cast<Type>(vv);
+    }
+  }
+  copy_n(Mh.data(), Mh.size(), M.origin());
+#else
   fill_n(pointer_dispatch(M.origin()), M.num_elements(), Type(0));
   auto pbegin = A.pointers_begin();
   auto pend   = A.pointers_end();
@@ -792,6 +833,7 @@ void Matrix2MA(char TA, CSR const& A, MultiArray2D& M, Vector const& occups)
         M[c0[ip - p0]][i] = static_cast<Type>(ma::conj(v0[ip - p0]));
     }
   }
+#endif
 }
 
 template<class MA,

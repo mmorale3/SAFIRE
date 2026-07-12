@@ -449,6 +449,141 @@ inline void ph_excited_energies_second_step(int nelec, int nact, PH_EXCT& abij, 
   }
 }
 
+// Config-blocked variant of ph_excited_energies_second_step.
+// Processes only the BETA unique excitations whose global index is in [g0, g1)
+// (g0 is also the block origin: KEr[g-g0] holds T_beta for global excitation g).
+// wgt is the FULL global weight array; E is a per-walker scratch accumulated by the caller.
+// Scratch (RBuff/KEBuff) is sized on the block, not the full shell, so it shrinks with Bc.
+template<class PH_EXCT, class MatW, class MatT, class MatE, class MatKr, class Op>
+inline void ph_excited_energies_second_step_block(int nelec, int nact, PH_EXCT& abij,
+       int g0, int g1, MatW&& wgt, MatT&& T, MatE&& E, MatKr&& KEr, Op& HamOps)
+{
+  using VType = typename std::decay_t<MatKr>::element_type;
+  using ptr = device_ptr<VType>;
+  using buffer_alloc_type       = DeviceBufferManager::template allocator_t<VType>;
+  using Cbuffer_alloc_type      = DeviceBufferManager::template allocator_t<ComplexType>;
+
+  DeviceBufferManager buffer_manager;
+  int nwalk = E.size(0);
+  int spin(1);
+  int nke = KEr.size(2);
+  RUNTIME_CHECK(T.size(0) == nwalk, "");
+  RUNTIME_CHECK(E.size(1) == 3, "");
+  RUNTIME_CHECK(KEr.size(1) == nwalk, "");
+
+  // block-sized scratch: max over shells of the intersection with [g0,g1)
+  long max2 = 0, max3 = 0;
+  for (int nex = 1, idet = 1; nex < abij.maximum_excitation_number()[spin]; nex++)
+  {
+    int nd = abij.number_of_unique_excitations(nex)[spin];
+    int a = std::max(idet, g0), b = std::min(idet + nd, g1);
+    long cnt = (a < b) ? long(b - a) : 0;
+    if (cnt > max2) max2 = cnt;
+    if (cnt * nex * nact > max3) max3 = cnt * nex * nact;
+    idet += nd;
+  }
+  if (max2 == 0) return;  // nothing excited in this block
+
+  StaticVector<VType, buffer_alloc_type> RBuff(iextensions<1u>{nwalk * max3},
+                buffer_manager.get_generator().template get_allocator<VType>());
+  StaticVector<VType, buffer_alloc_type> KEBuff(iextensions<1u>{nwalk * max2 * nke},
+                buffer_manager.get_generator().template get_allocator<VType>());
+  StaticVector<ComplexType, Cbuffer_alloc_type> eloc(iextensions<1u>{nwalk},
+                buffer_manager.get_generator().template get_allocator<ComplexType>());
+  auto refc = abij.get_reference_configuration_device(spin);
+
+  ma::fill(E, ComplexType(0.0));
+
+  for (int nex = 1, idet = 1; nex < abij.maximum_excitation_number()[spin]; nex++)
+  {
+    int nd = abij.number_of_unique_excitations(nex)[spin];
+    if (nd > 0)
+    {
+      int a = std::max(idet, g0), b = std::min(idet + nd, g1);
+      if (a < b)
+      {
+        int cnt = b - a;
+        int off = a - idet;  // offset of the block within this shell
+        auto iexcit = abij.get_excitation_list_device(spin, nex) + 2 * nex * off;
+        Array_ref<VType, 4, ptr> R(RBuff.origin(), {nwalk, cnt, nex, nact});
+        Array_ref<VType, 3, ptr> KEl(KEBuff.origin(), {cnt, nwalk, nke});
+
+        fill_n(R.origin(), R.num_elements(), VType(0.0));
+        get_compact_ph_R_matrices(0, 1, spin, nwalk, cnt, nex, nelec, nact, iexcit, refc, abij, T, R);
+
+        HamOps.ph_excited_energy(Beta, cnt, nex, nelec, nact, iexcit, refc, E,
+                  wgt.sliced(a, a + cnt), R, KEl, true);
+
+        ma::fill(eloc, ComplexType(0.0));
+        for (int d = 0; d < cnt; d++)
+          ma::dot('N', 'N', ComplexType(1.0), KEr[(a - g0) + d], KEl[d], ComplexType(1.0), eloc);
+        ma::axpy(ComplexType(1.0), eloc, E({0, nwalk}, 2));
+      }
+      idet += nd;
+    }
+  }
+}
+
+// Config-blocked variant of ph_excited_energies_first_step (ALPHA).
+// Builds the alpha KE vectors for the EXCITED alpha excitations with global index in
+// [g0,g1) into KE (block-local: KE[g-g0]), and accumulates E1/EXX into E.
+// Unlike the beta step there is no EJ contraction here (the alpha KE is consumed by the
+// coupling GEMM in the caller). wgt is the FULL global alpha weight array.
+template<class PH_EXCT, class MatW, class MatT, class MatE, class MatK, class Op>
+inline void ph_excited_energies_first_step_block(int nelec, int nact, PH_EXCT& abij,
+                    int g0, int g1, MatW&& wgt, MatT&& T, MatE&& E, MatK&& KE, Op& HamOps)
+{
+  using VType = typename std::decay_t<MatK>::element_type;
+  using ptr = device_ptr<VType>;
+  using buffer_alloc_type       = DeviceBufferManager::template allocator_t<VType>;
+
+  DeviceBufferManager buffer_manager;
+  int nwalk = E.size(0);
+  int spin(0);
+  RUNTIME_CHECK(T.size(0) == nwalk, "");
+  RUNTIME_CHECK(E.size(1) == 3, "");
+  RUNTIME_CHECK(KE.size(1) == nwalk, "");
+
+  long max3 = 0;
+  for (int nex = 1, idet = 1; nex < abij.maximum_excitation_number()[spin]; nex++)
+  {
+    int nd = abij.number_of_unique_excitations(nex)[spin];
+    int a = std::max(idet, g0), b = std::min(idet + nd, g1);
+    long cnt = (a < b) ? long(b - a) : 0;
+    if (cnt * nex * nact > max3) max3 = cnt * nex * nact;
+    idet += nd;
+  }
+
+  ma::fill(E, ComplexType(0.0));
+  if (max3 == 0) return;  // no excited alpha in this block (e.g. block 0 = reference only)
+
+  StaticVector<VType, buffer_alloc_type> RBuff(iextensions<1u>{nwalk * max3},
+                buffer_manager.get_generator().template get_allocator<VType>());
+  auto refc = abij.get_reference_configuration_device(spin);
+
+  for (int nex = 1, idet = 1; nex < abij.maximum_excitation_number()[spin]; nex++)
+  {
+    int nd = abij.number_of_unique_excitations(nex)[spin];
+    if (nd > 0)
+    {
+      int a = std::max(idet, g0), b = std::min(idet + nd, g1);
+      if (a < b)
+      {
+        int cnt = b - a;
+        int off = a - idet;
+        auto iexcit = abij.get_excitation_list_device(spin, nex) + 2 * nex * off;
+        Array_ref<VType, 4, ptr> R(RBuff.origin(), {nwalk, cnt, nex, nact});
+        fill_n(R.origin(), R.num_elements(), VType(0.0));
+        get_compact_ph_R_matrices(0, 1, spin, nwalk, cnt, nex, nelec, nact, iexcit, refc, abij, T, R);
+        auto KEr = KE.sliced(a - g0, a - g0 + cnt);
+        HamOps.ph_excited_energy(Alpha, cnt, nex, nelec, nact, iexcit, refc, E,
+                  wgt.sliced(a, a + cnt), R, KEr, true);
+      }
+      idet += nd;
+    }
+  }
+}
+
 #if defined(ENABLE_CUDA) || defined(ENABLE_HIP)
 template<class MArray, class MatA, class PH_EXCT,
          typename = std::enable_if_t< is_device_array<MatA>::value >,

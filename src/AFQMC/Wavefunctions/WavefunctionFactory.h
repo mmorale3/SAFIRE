@@ -73,6 +73,12 @@ public:
     // set default later, since it depends on HamiltonianOperations type
     if( auto val = pt0.get_optional<bool>("dense_trial") )
       pt1.put("dense_trial", *val);
+    // forward the trial-wavefunction batching knobs so they reach the trial ctor:
+    // nbatch = walker batch, ndet_batch = config (unique-excitation) batch for PHMSD alg1.
+    if( auto val = pt0.get_optional<int>("nbatch") )
+      pt1.put("nbatch", *val);
+    if( auto val = pt0.get_optional<int>("ndet_batch") )
+      pt1.put("ndet_batch", *val);
     std::unordered_set<std::string> pass_through_keys = {
       "system"
     };

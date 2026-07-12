@@ -21,6 +21,9 @@
 #include "Numerics/csr_blas.hpp"
 #include "AFQMC/Wavefunctions/PHMSD.hpp"
 #include "Numerics/batched_operations.hpp"
+#if defined(ENABLE_DEVICE)
+#include "Numerics/detail/CUDA/Kernels/phmsd_vmf.cuh"
+#endif
 
 namespace sfqmc
 {
@@ -350,8 +353,8 @@ void PHMSD<MP>::energy_shared_alg1(const WlkSet& wset, Mat&& E, TVec&& Ov)
     auto GAdims0 = dm_dims_ref(false, Alpha);
     auto GBdims0 = dm_dims_ref(false, Beta);
 
-    // generalize later
-    int nbatch__ = nwalk;
+    // walker-batch size from the nbatch input knob (nbatch<0 => all walkers at once); matches the other PHMSD methods
+    const int nbatch__ = std::min(int(nwalk), (nbatch < 0 ? int(nwalk) : nbatch));
 
     StaticMatrix ebuff({nbatch__, 3}, ComplexType(0.0),
                      buffer_manager.get_generator().template get_allocator<ComplexType>());
@@ -415,13 +418,16 @@ void PHMSD<MP>::energy_shared_alg1(const WlkSet& wset, Mat&& E, TVec&& Ov)
       ma::elementwise(ma::TOp_MUL, 1, overlaps[0].sliced(0,nb), Ovlps[0].sliced(0,nexcit[0]));
       ma::elementwise(ma::TOp_MUL, 1, overlaps[1].sliced(0,nb), Ovlps[1].sliced(0,nexcit[1]));
 
+      if (ndet_batch < 0)
+      {
+      // full-config path: KEright holds the full [maxn_unique_confg, nb, nkev] alpha (then beta=T_beta) KE
       StaticSHMSP3Tensor KEright({maxn_unique_confg, nb, nkev}, SPComplexType(0.0),
                      shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
       { // spin up
         // 2a. calculate weights
         StaticMatrix wgt({nexcit[0], nb}, SPComplexType(0.0),
                      buffer_manager.get_generator().template get_allocator<ComplexType>());
-        // W[u][iw] = sum_d OpSpinDetCouplings[u][d] Ov[d][iw]   
+        // W[u][iw] = sum_d OpSpinDetCouplings[u][d] Ov[d][iw]
         ma::product(OpSpinDetCouplings[0], Ovlps[1].sliced(0, nexcit[1]), wgt);
         // W[u][iw] *= Ovlps[0][u][iw]   
         ma::elementwise(ma::TOp_MUL, Ovlps[0].sliced(0,nexcit[0]), wgt);
@@ -443,7 +449,7 @@ void PHMSD<MP>::energy_shared_alg1(const WlkSet& wset, Mat&& E, TVec&& Ov)
                     local_QQ0inv0, eloc, KEright.sliced(0,nexcit[0]), HamOp);
         ma::add(ComplexType(1.0), eloc, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
 
-        StaticSHMSP3Tensor Tdn( {nexcit[0], nwalk, nkev}, SPComplexType(0.0),
+        StaticSHMSP3Tensor Tdn( {nexcit[0], nb, nkev}, SPComplexType(0.0),
                      shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
         // scale KE vectors by overlaps:  KEright[nd][iw][n] *= Ovmsd[0][nd][iw] 
         ma::elementwise(ma::TOp_MUL, 0, Ovlps[0].sliced(0, nexcit[0]), KEright.sliced(0, nexcit[0]));
@@ -481,10 +487,97 @@ void PHMSD<MP>::energy_shared_alg1(const WlkSet& wset, Mat&& E, TVec&& Ov)
         // opSpinEJ[iw] += tmp[iw]
         ma::axpy(ComplexType(1.0), tmp, E({iw, iw+nb}, 2));
 
-        //4b. calculate R matrices and evaluate E, KEright 
-        ph_excited_energies_second_step(NAEB, OrbMats[1].size(0), abij, wgt, 
+        //4b. calculate R matrices and evaluate E, KEright
+        ph_excited_energies_second_step(NAEB, OrbMats[1].size(0), abij, wgt,
                             local_QQ0inv1, eloc, KEright.sliced(0, nexcit[1]),  HamOp);
         ma::add(ComplexType(1.0), eloc, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
+      }
+      } // end original full-config path (ndet_batch < 0)
+      else
+      {
+        // ================= Tier-2b config-blocked path (nested beta x alpha) =================
+        // Neither the full alpha KE (Tdn) nor the full T_beta is materialized; both are tiled.
+        // Uses ctor-built OpSpinDetCouplings_sp_colblk (alpha-column blocks, device-resident).
+        // alpha weights + overlap (full, cheap: no nkev factor)
+        StaticMatrix wgt_a({nexcit[0], nb}, SPComplexType(0.0),
+                     buffer_manager.get_generator().template get_allocator<ComplexType>());
+        ma::product(OpSpinDetCouplings[0], Ovlps[1].sliced(0, nexcit[1]), wgt_a);
+        ma::elementwise(ma::TOp_MUL, Ovlps[0].sliced(0, nexcit[0]), wgt_a);
+        ma::accumulate(0, wgt_a, Ov.sliced(iw, iw+nb));
+        // beta weights (full, cheap)
+        StaticMatrix wgt_b({nexcit[1], nb}, SPComplexType(0.0),
+                     buffer_manager.get_generator().template get_allocator<ComplexType>());
+        ma::product(OpSpinDetCouplings[1], Ovlps[0].sliced(0, nexcit[0]), wgt_b);
+        ma::elementwise(ma::TOp_MUL, Ovlps[1].sliced(0, nexcit[1]), wgt_b);
+        // reference-alpha energy + KE (kept in a small buffer, seeds alpha block 0 local index 0)
+        StaticSHMSP3Tensor KEalpha_ref({1, nb, nkev}, SPComplexType(0.0),
+                     shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+        HamOp.ph_reference_energy(Alpha, eloc, GA.rotated().flatted().unrotated(),
+                    KEalpha_ref[0], TG.TG_local().root());
+        ma::elementwise(ma::TOp_MUL, 0, Ov.sliced(iw, iw+nb), eloc);
+        ma::add(ComplexType(1.0), eloc, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
+        // reference-beta energy + KE
+        StaticSHMSPMatrix KEleft({nb, nkev}, SPComplexType(0.0),
+                     shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+        HamOp.ph_reference_energy(Beta, eloc, GB.rotated().flatted().unrotated(),
+                    KEleft, TG.TG_local().root());
+        ma::elementwise(ma::TOp_MUL, 0, Ov.sliced(iw, iw+nb), eloc);
+        ma::add(ComplexType(1.0), eloc, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
+        // block sizes: alpha Bca MUST match the ctor colblk (Bc=min(ndet_batch,nexcit[0]))
+        int Bca = int(long(ndet_batch) < nexcit[0] ? long(ndet_batch) : nexcit[0]);
+        if (Bca < 1) Bca = 1;
+        int Bcb = int(long(ndet_batch) < nexcit[1] ? long(ndet_batch) : nexcit[1]);
+        if (Bcb < 1) Bcb = 1;
+        // per-alpha-block E1/EXX scratch (added to E only on the first beta pass)
+        StaticMatrix eloc_a({nb, 3}, ComplexType(0.0),
+                     buffer_manager.get_generator().template get_allocator<ComplexType>());
+        for (int v0 = 0; v0 < int(nexcit[1]); v0 += Bcb)
+        {
+          int v1 = int(long(v0) + Bcb < nexcit[1] ? long(v0) + Bcb : nexcit[1]);
+          int cntv = v1 - v0;
+          bool first_beta = (v0 == 0);
+          StaticSHMSP3Tensor Tbeta({cntv, nb, nkev}, SPComplexType(0.0),
+                       shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+          auto Tbeta2D = Tbeta.rotated().flatted().unrotated();  // [cntv, nb*nkev]
+          for (int iu = 0, u0 = 0; u0 < int(nexcit[0]); iu++, u0 += Bca)
+          {
+            int u1 = int(long(u0) + Bca < nexcit[0] ? long(u0) + Bca : nexcit[0]);
+            int cntu = u1 - u0;
+            // alpha KE for this alpha block (block-local); block 0 local 0 == reference alpha
+            StaticSHMSP3Tensor KEalpha_U({cntu, nb, nkev}, SPComplexType(0.0),
+                         shm_buffer_manager.get_generator().template get_allocator<SPComplexType>());
+            if (u0 == 0)
+              copy_n(KEalpha_ref.origin(), size_t(nb) * nkev, KEalpha_U.origin());
+            // excited alpha [max(u0,1),u1): fills KEalpha_U + E1/EXX -> eloc_a
+            ph_excited_energies_first_step_block(NAEA, OrbMats[0].size(0), abij, u0, u1, wgt_a,
+                        local_QQ0inv0, eloc_a, KEalpha_U, HamOp);
+            if (first_beta)
+              ma::add(ComplexType(1.0), eloc_a, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
+            // Tdn_U = Ovlps[0][u0:u1] * KEalpha_U
+            ma::elementwise(ma::TOp_MUL, 0, Ovlps[0].sliced(u0, u1), KEalpha_U.sliced(0, cntu));
+            auto Tdn_U2D = KEalpha_U.sliced(0, cntu).rotated().flatted().unrotated();  // [cntu, nb*nkev]
+            // T_beta[V] += colblk(iv,iu) . Tdn_U  (pre-built 0-based 2D block).
+            // Tbeta is zero-initialized, so accumulate (beta=1) for every block; skip empty
+            // blocks (cusparse SpMM errors on nnz==0, which happens for many (iv,iu) pairs).
+            int blk = (v0 / Bcb) * colblk_nab_alpha + iu;
+            if (!colblk_empty[blk])
+              ma::product(SPComplexType(1.0), OpSpinDetCouplings_sp_colblk[blk],
+                          Tdn_U2D, SPComplexType(1.0), Tbeta2D);
+          }
+          // scale T_beta[V] by Ovlps[1][v0:v1]
+          ma::elementwise(ma::TOp_MUL, 0, Ovlps[1].sliced(v0, v1), Tbeta.sliced(0, cntv));
+          // reference-beta EJ (global beta index 0) belongs to block 0
+          if (v0 == 0)
+          {
+            auto tmp = eloc.flatted().sliced(0, nb);
+            ma::dot('N', 'N', Tbeta[0], KEleft, tmp);
+            ma::axpy(ComplexType(1.0), tmp, E({iw, iw+nb}, 2));
+          }
+          // excited-beta contributions (E1/EXX + EJ) for this block
+          ph_excited_energies_second_step_block(NAEB, OrbMats[1].size(0), abij, v0, v1, wgt_b,
+                      local_QQ0inv1, eloc, Tbeta, HamOp);
+          ma::add(ComplexType(1.0), eloc, ComplexType(1.0), E.sliced(iw, iw+nb), E.sliced(iw, iw+nb));
+        }
       }
     }
   }
@@ -593,7 +686,7 @@ void PHMSD<MP>::MixedDensityMatrix_impl(const WlkSet& wset, MatG&& G, TVec&& Ov,
             LogOverlapFactor, overlaps.sliced(0,nb), refc_dev.origin(), local_QQ0inv0, true);
 
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, Ovlps[0].sliced(0,nexcit[0]));
+      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, Ovlps[0]({0,nexcit[0]},{iw,iw+nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 0, abij, local_QQ0inv0[i], Ovlps[0]({0,nexcit[0]}, iw+i));
@@ -716,7 +809,7 @@ void PHMSD<MP>::MixedDensityMatrix_impl(const WlkSet& wset, MatG&& G, TVec&& Ov,
             LogOverlapFactor, overlaps[0].sliced(0,nb), refc_dev.origin(), local_QQ0inv0, true);
 
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, Ovlps[0].sliced(0,nexcit[0]));
+      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, Ovlps[0]({0,nexcit[0]},{iw,iw+nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 0, abij, local_QQ0inv0[i], Ovlps[0]({0,nexcit[0]}, iw+i));
@@ -725,7 +818,7 @@ void PHMSD<MP>::MixedDensityMatrix_impl(const WlkSet& wset, MatG&& G, TVec&& Ov,
       SDetOp.BatchedMixedDensityMatrixForWoodbury(OrbMats[1], SMdn.sliced(iw,iw+nb), GB,
             LogOverlapFactor, overlaps[1].sliced(0,nb), refc_dev.origin()+NAEA, local_QQ0inv1, true);
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 1, abij, local_QQ0inv1, Ovlps[1].sliced(0,nexcit[1]));
+      calculate_overlaps(0, 1, 1, abij, local_QQ0inv1, Ovlps[1]({0,nexcit[1]},{iw,iw+nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 1, abij, local_QQ0inv1[i], Ovlps[1]({0,nexcit[1]}, iw+i)); 
@@ -1033,7 +1126,7 @@ void PHMSD<MP>::Overlap(const WlkSet& wset, TVec&& Ov)
       SDetOp.BatchedOverlapForWoodbury(OrbMats[0], SM.sliced(iw,iw+nb), LogOverlapFactor, 
                 ov0.sliced(0,nb), refc_dev.origin(), local_QQ0inv0);
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, ovlp_list.sliced(0,nexcit[0]));
+      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, ovlp_list({0,nexcit[0]},{0,nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 0, abij, local_QQ0inv0[i], ovlp_list({0,nexcit[0]}, i));
@@ -1087,7 +1180,7 @@ void PHMSD<MP>::Overlap(const WlkSet& wset, TVec&& Ov)
       SDetOp.BatchedOverlapForWoodbury(OrbMats[0], SMup.sliced(iw,iw+nb), LogOverlapFactor, 
                 ov0[0].sliced(0,nb), refc_dev.origin(), local_QQ0inv0);
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, ovlp_list[0].sliced(0,nexcit[0]));
+      calculate_overlaps(0, 1, 0, abij, local_QQ0inv0, ovlp_list[0]({0,nexcit[0]},{0,nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 0, abij, local_QQ0inv0[i], ovlp_list[0]({0,nexcit[0]}, i));
@@ -1097,7 +1190,7 @@ void PHMSD<MP>::Overlap(const WlkSet& wset, TVec&& Ov)
       SDetOp.BatchedOverlapForWoodbury(OrbMats[1], SMdn.sliced(iw,iw+nb), LogOverlapFactor, 
                 ov0[1].sliced(0,nb), refc_dev.origin() + NAEA, local_QQ0inv1);
 #if defined(ENABLE_CUDA)
-      calculate_overlaps(0, 1, 1, abij, local_QQ0inv1, ovlp_list[1].sliced(0,nexcit[1]));
+      calculate_overlaps(0, 1, 1, abij, local_QQ0inv1, ovlp_list[1]({0,nexcit[1]},{0,nb}));
 #else
       for(int i=0; i<nb; ++i)
         calculate_overlaps(0, 1, 1, abij, local_QQ0inv1[i], ovlp_list[1]({0,nexcit[1]}, i));
@@ -1592,6 +1685,51 @@ void PHMSD<MP>::vMF(Vec&& v, double dt)
   TG.Node().barrier();
 
   // 1. Overlaps
+#if defined(ENABLE_DEVICE)
+  {
+    const int nbov_ = 256;
+    for (int spin = 0, nc = 0; spin < nspins; ++spin)
+    {
+      int NE_ = (spin == 0) ? NAEA : NAEB;
+      confg.resize(NE_);
+      auto Gdims_ref = dm_dims_ref(false, SpinTypes(spin));
+      int nconf_ = int(abij.number_of_unique_excitations()[spin]);
+      Static3Tensor SMb_({nbov_, int(Gdims_ref.second), int(Gdims_ref.first)},
+                         buffer_manager.get_generator().template get_allocator<ComplexType>());
+      StaticVector ovb_(iextensions<1u>{size_t(nbov_)}, ComplexType(0.0),
+                        buffer_manager.get_generator().template get_allocator<ComplexType>());
+      Vector<ComplexType> ovh_(iextensions<1u>{size_t(nbov_)});
+      std::vector<int> ndl_;
+      ndl_.reserve(nbov_);
+      for (int nd = 0; nd < nconf_; ++nd, ++nc)
+      {
+        if (nc % TG.Global().size() != TG.Global().rank())
+          continue;
+        int b = int(ndl_.size());
+        abij.get_configuration(spin, nd, confg);
+        auto&& SMslice_ = SMb_[b];
+        ma::Matrix2MA('H', OrbMats[spin], SMslice_, confg);
+        ndl_.push_back(nd);
+        if (int(ndl_.size()) == nbov_)
+        {
+          SDetOp.BatchedOverlap(SMb_.sliced(0, nbov_), SMb_.sliced(0, nbov_), ComplexType(0.0), ovb_.sliced(0, nbov_));
+          copy_n(ovb_.origin(), nbov_, ovh_.origin());
+          for (int k = 0; k < nbov_; ++k)
+            ovlps[spin][ndl_[k]] = ovh_[k];
+          ndl_.clear();
+        }
+      }
+      int cn_ = int(ndl_.size());
+      if (cn_ > 0)
+      {
+        SDetOp.BatchedOverlap(SMb_.sliced(0, cn_), SMb_.sliced(0, cn_), ComplexType(0.0), ovb_.sliced(0, cn_));
+        copy_n(ovb_.origin(), cn_, ovh_.origin());
+        for (int k = 0; k < cn_; ++k)
+          ovlps[spin][ndl_[k]] = ovh_[k];
+      }
+    }
+  }
+#else
   for (int spin = 0, nc = 0; spin < nspins; ++spin)
   {
     confg.resize((spin == 0) ? NAEA : NAEB);
@@ -1608,6 +1746,7 @@ void PHMSD<MP>::vMF(Vec&& v, double dt)
       }
     }
   }
+#endif
   TG.Node().barrier();
   TG.Global().all_reduce_in_place_n(raw_pointer_cast(ovlps.origin()), ovlps.num_elements(), std::plus<>());
   TG.Node().barrier();
@@ -1680,44 +1819,58 @@ void PHMSD<MP>::vMF(Vec&& v, double dt)
     confgB.resize((spin == 0) ? NAEA : NAEB);
     if(walker_type == COLLINEAR) 
     {
+#if defined(ENABLE_DEVICE)
+      // GPU evaluation of the off-diagonal contribution (replaces the O(sum nnz^2) host loop).
+      {
+        int NE_ = (spin == 0) ? NAEA : NAEB;
+        int nconf_ = int(abij.number_of_unique_excitations()[spin]);
+        std::vector<int> hconf_(size_t(nconf_) * size_t(NE_));
+        std::vector<int> tmp_(NE_);
+        for (int cf = 0; cf < nconf_; ++cf)
+        {
+          abij.get_configuration(spin, cf, tmp_);
+          std::sort(tmp_.begin(), tmp_.end());
+          std::copy(tmp_.begin(), tmp_.end(), hconf_.begin() + size_t(cf) * size_t(NE_));
+        }
+        IVector dconf_(iextensions<1u>{size_t(nconf_) * size_t(NE_)});
+        copy_n(hconf_.data(), hconf_.size(), dconf_.origin());
+        kernels::vmf_offdiag(int(abij.number_of_unique_excitations()[other_spin]),
+                             TG.Global().rank(), TG.Global().size(), NE_,
+                             raw_pointer_cast(OpSpinDetCouplings[other_spin].pointers_begin()),
+                             raw_pointer_cast(OpSpinDetCouplings[other_spin].pointers_end()),
+                             raw_pointer_cast(OpSpinDetCouplings[other_spin].non_zero_indices2_data()),
+                             raw_pointer_cast(OpSpinDetCouplings[other_spin].non_zero_values_data()),
+                             raw_pointer_cast(dconf_.origin()),
+                             raw_pointer_cast(OrbMats[spin].pointers_begin()),
+                             raw_pointer_cast(OrbMats[spin].pointers_end()),
+                             raw_pointer_cast(OrbMats[spin].non_zero_indices2_data()),
+                             raw_pointer_cast(OrbMats[spin].non_zero_values_data()),
+                             raw_pointer_cast(G.origin()), int(G.stride(0)));
+      }
+#else
       for (int nd = 0; nd < int(abij.number_of_unique_excitations()[other_spin]); ++nd)
       {
         if (nd % TG.Global().size() == TG.Global().rank())
         {
-          auto D = OpSpinDetCouplings[other_spin][nd];     
+          auto D = OpSpinDetCouplings[other_spin][nd];
           size_t nnz = D.num_non_zero_elements();
-#if defined(ENABLE_DEVICE)
-          auto val_d = D.non_zero_values_data();
-          auto jdet_d = D.non_zero_indices2_data();
-          Vector<ComplexType> val(nnz);
-          Vector<int> jdet(nnz);
-          copy_n(val_d,nnz,val.origin());
-          copy_n(jdet_d,nnz,jdet.origin());
-#else   
-          auto val = D.non_zero_values_data(); 
+          auto val = D.non_zero_values_data();
           auto jdet = D.non_zero_indices2_data();
-#endif 
-          for (size_t n1=0; n1<nnz; ++n1)  
+          for (size_t n1=0; n1<nnz; ++n1)
           {
-            size_t cf1 = size_t(jdet[n1]); 
+            size_t cf1 = size_t(jdet[n1]);
             abij.get_configuration(spin, cf1, confg);
             sort(confg.begin(), confg.end());
             for (size_t n2=n1+1; n2<nnz; ++n2)
             {
-              size_t cf2 = size_t(jdet[n2]); 
+              size_t cf2 = size_t(jdet[n2]);
               abij.get_configuration(spin, cf2, confgB);
               sort(confgB.begin(), confgB.end());
               exct.clear();
               int np = get_excitation_number(true, confg, confgB, exct, dummy, Iwork);
               if (np == 1)
               {
-                ComplexType wgt = val[n1] * ma::conj(val[n2]); 
-                /*
-                 * exct: [0]: location of orbital being excited, [1]: excited orbital 
-                 * confg[exct[0]]: occupied orbital being excited
-                 * WARNING!!! Assumes orthogonal states, needs overlap factor!!!
-                 * Either calculate it (expensive) or demand orthogonality!!!   
-                 */
+                ComplexType wgt = val[n1] * ma::conj(val[n2]);
                 exct[0] = confg[exct[0]];
                 ma::Matrix2MA('Z', OrbMats[spin], orbs, exct);
                 ma::axpy(wgt, orbs[0], G[exct[1]]);
@@ -1727,6 +1880,7 @@ void PHMSD<MP>::vMF(Vec&& v, double dt)
           }
         }
       }
+#endif
     } else {
       auto D = OpSpinDetCouplings[1][0];     
       size_t nunique = D.num_non_zero_elements();
